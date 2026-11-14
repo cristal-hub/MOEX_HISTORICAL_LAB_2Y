@@ -1,0 +1,6 @@
+# MOEX_HISTORICAL_LAB_2Y — зависимости (минимум)
+pandas
+numpy
+pandas-ta-classic
+scipy
+pytest

@@ -1,0 +1,24 @@
+{
+  "created_utc": "2026-11-14T09:40:41.607740+00:00",
+  "sdk_version": "1.51.0",
+  "mode": "READ_ONLY",
+  "live_orders": false,
+  "real_money": false,
+  "broker_execution": false,
+  "token_value_saved": false,
+  "token_variable": "TINKOFF_READONLY_TOKEN",
+  "authorization": "OK",
+  "instrument_list": "OK",
+  "instruments": [
+    {
+      "ticker": "SBER",
+      "selection": "NOT_FOUND_OR_NOT_AVAILABLE"
+    },
+    {
+      "ticker": "GAZP",
+      "selection": "NOT_FOUND_OR_NOT_AVAILABLE"
+    }
+  ],
+  "errors": [],
+  "shares_received": 1910
+}
