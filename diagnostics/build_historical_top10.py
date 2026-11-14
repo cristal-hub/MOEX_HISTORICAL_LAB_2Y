@@ -2,6 +2,7 @@
 # ============================================================
 # MOEX_HISTORICAL_LAB_2Y
 # HISTORICAL DYNAMIC TOP-10 BUILDER
+# VERSION: ATR14_WILDER_RMA
 #
 # STRATEGY LOGIC: UNCHANGED
 # RESEARCH ONLY
@@ -21,8 +22,8 @@ import json
 import math
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from collections import defaultdict
 from bisect import bisect_left
+
 
 ROOT = Path(r"C:\Users\Cristal\Desktop\MOEX_HISTORICAL_LAB_2Y")
 
@@ -38,9 +39,8 @@ MIN_CANDLES = 29
 MIN_DAILY_TURNOVER_RUB = 10_000_000
 TOP_N = 10
 
-# Primary historical method:
-# [selection_date - 30 calendar days, selection_date)
 WINDOW_MODE = "B_STRICT_PREVIOUS_30D"
+ATR_METHOD = "WILDER_RMA_ALPHA_1_OVER_14_ADJUST_TRUE"
 
 FIELDS = [
     "selection_date", "rank", "ticker", "name", "uid", "figi",
@@ -70,7 +70,9 @@ def save_csv(path, rows, fields):
 
     with tmp.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(
-            f, fieldnames=fields, extrasaction="ignore"
+            f,
+            fieldnames=fields,
+            extrasaction="ignore"
         )
         writer.writeheader()
         writer.writerows(rows)
@@ -83,6 +85,7 @@ def latest_registry():
         p for p in REGISTRY_DIR.glob("instrument_registry_*.json")
         if not p.name.endswith(".summary.json")
     ]
+
     if not files:
         raise FileNotFoundError("Instrument registry not found")
 
@@ -109,8 +112,10 @@ def latest_registry():
 
 def parse_time(value):
     dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
+
     return dt.astimezone(timezone.utc)
 
 
@@ -121,14 +126,13 @@ def load_daily_file(path):
     if not path.exists():
         return rows, 0, 0
 
-    with path.open(
-        "r", newline="", encoding="utf-8-sig"
-    ) as f:
+    with path.open("r", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
 
         required = {
             "time", "open", "high", "low", "close", "volume"
         }
+
         if not required.issubset(set(reader.fieldnames or [])):
             raise ValueError(
                 f"Unexpected CSV columns in {path.name}"
@@ -137,6 +141,7 @@ def load_daily_file(path):
         for raw in reader:
             try:
                 dt = parse_time(raw["time"])
+
                 o = float(raw["open"])
                 h = float(raw["high"])
                 low = float(raw["low"])
@@ -145,10 +150,13 @@ def load_daily_file(path):
 
                 if min(o, h, low, c) <= 0:
                     raise ValueError("Non-positive OHLC")
+
                 if h < max(o, low, c):
                     raise ValueError("Invalid high")
+
                 if low > min(o, h, c):
                     raise ValueError("Invalid low")
+
                 if v < 0:
                     raise ValueError("Negative volume")
 
@@ -167,44 +175,78 @@ def load_daily_file(path):
 
     # Keep first valid row for duplicate timestamps.
     unique = {}
+
     for row in sorted(rows, key=lambda x: x["time"]):
         unique.setdefault(row["time"], row)
 
     result = list(unique.values())
+
     return result, invalid, len(rows) - len(result)
 
 
-def calculate_metrics(rows, selection_date):
+def calculate_wilder_rma(values, period):
+    """
+    Wilder RMA / pandas-ta style exponential moving average.
+
+    alpha = 1 / period
+    adjust = True
+    min_periods = period
+
+    This reproduces the normalized exponentially weighted
+    calculation used by pandas-ta's RMA implementation.
+    """
+
+    if len(values) < period:
+        return None
+
+    alpha = 1.0 / period
+    decay = 1.0 - alpha
+
+    weighted_sum = 0.0
+    weight_sum = 0.0
+    valid_count = 0
+    result = None
+
+    for value in values:
+        if value is None or not math.isfinite(value):
+            continue
+
+        weighted_sum = value + decay * weighted_sum
+        weight_sum = 1.0 + decay * weight_sum
+        valid_count += 1
+
+        if valid_count >= period and weight_sum > 0:
+            result = weighted_sum / weight_sum
+
+    return result
+
+
+def calculate_metrics(rows, dates, selection_date):
     """
     Calculate metrics from candles in:
-    [selection_date - 30 days, selection_date)
 
-    ATR uses True Range with previous close.
-    The previous close immediately before the window is
-    allowed only as the reference for the first TR.
+        [selection_date - 30 days, selection_date)
+
+    Selection-date candle is strictly excluded.
+
+    Previous close immediately before the window is used
+    only as the reference for the first True Range.
     """
 
     window_start = selection_date - timedelta(days=PERIOD_DAYS)
 
-    # Strictly exclude the selection date and all later candles.
-    prior = [r for r in rows if r["date"] < selection_date]
+    start_index = bisect_left(dates, window_start)
+    end_index = bisect_left(dates, selection_date)
 
-    window = [
-        r for r in prior
-        if r["date"] >= window_start
-    ]
+    window = rows[start_index:end_index]
 
     if len(window) < MIN_CANDLES:
         return None
 
-    # Find the candle immediately before the window, if available.
-    previous_rows = [
-        r for r in rows
-        if r["date"] < window_start
-    ]
-
     previous_close = (
-        previous_rows[-1]["close"] if previous_rows else None
+        rows[start_index - 1]["close"]
+        if start_index > 0
+        else None
     )
 
     true_ranges = []
@@ -222,10 +264,11 @@ def calculate_metrics(rows, selection_date):
         true_ranges.append(tr)
         previous_close = row["close"]
 
-    if len(true_ranges) < ATR_PERIOD:
+    atr = calculate_wilder_rma(true_ranges, ATR_PERIOD)
+
+    if atr is None:
         return None
 
-    atr = sum(true_ranges[-ATR_PERIOD:]) / ATR_PERIOD
     last_close = window[-1]["close"]
 
     if last_close <= 0 or atr <= 0:
@@ -266,6 +309,7 @@ def main():
 
     log("=" * 70)
     log("HISTORICAL DYNAMIC TOP-10 BUILDER")
+    log("ATR: WILDER RMA / PANDAS-TA STYLE")
     log("READ ONLY / NO TRADING")
     log("=" * 70)
 
@@ -274,10 +318,10 @@ def main():
     log(f"REGISTRY: {registry_path}")
     log(f"ELIGIBLE INSTRUMENTS: {len(instruments)}")
 
-    # Load daily data for all current eligible instruments.
     data = {}
     all_dates = set()
     missing_files = []
+
     invalid_total = 0
     duplicate_total = 0
 
@@ -298,12 +342,15 @@ def main():
         duplicate_total += duplicates
 
         if rows:
+            dates = [r["date"] for r in rows]
+
             data[uid] = {
                 "instrument": instrument,
                 "rows": rows,
-                "dates": [r["date"] for r in rows],
+                "dates": dates,
             }
-            all_dates.update(r["date"] for r in rows)
+
+            all_dates.update(dates)
 
         if index % 25 == 0 or index == len(instruments):
             log(
@@ -322,6 +369,7 @@ def main():
     log(f"INVALID ROWS SKIPPED: {invalid_total}")
     log(f"DUPLICATE ROWS REMOVED: {duplicate_total}")
     log(f"METHOD: {WINDOW_MODE}")
+    log(f"ATR METHOD: {ATR_METHOD}")
     log(f"TURNOVER FLOOR: {MIN_DAILY_TURNOVER_RUB:,.0f} RUB")
 
     top_rows = []
@@ -336,8 +384,11 @@ def main():
 
         for uid, item in data.items():
             instrument = item["instrument"]
+
             metric = calculate_metrics(
-                item["rows"], selection_date
+                item["rows"],
+                item["dates"],
+                selection_date
             )
 
             if metric is None:
@@ -353,11 +404,11 @@ def main():
                 "figi": instrument.get("figi"),
             }
 
-            # Preserve all valid metrics, including low-turnover.
             record["passes_turnover_floor"] = (
                 metric["avg_turnover_rub"]
                 >= MIN_DAILY_TURNOVER_RUB
             )
+
             metrics_rows.append(record)
 
             if record["passes_turnover_floor"]:
@@ -428,21 +479,21 @@ def main():
         "window_start", "window_end_exclusive",
         "passes_turnover_floor"
     ]
-    save_csv(metrics_path, metrics_rows, metrics_fields)
 
+    save_csv(metrics_path, metrics_rows, metrics_fields)
     atomic_json(daily_path, daily_summary)
 
-    # Check unresolved daily download chunks.
     manifest_path = DOWNLOAD_DIR / "download_manifest.json"
     failed_chunks = 0
+
     if manifest_path.exists():
         manifest = json.loads(
             manifest_path.read_text(encoding="utf-8")
         )
         failed_chunks = len(manifest.get("failed_chunks", {}))
 
-    # Count distinct instruments selected at least once.
     selected_uids = {r["uid"] for r in top_rows}
+
     selected_tickers = sorted({
         r["ticker"] for r in top_rows if r["ticker"]
     })
@@ -461,6 +512,7 @@ def main():
         "registry_file": str(registry_path),
         "daily_data_directory": str(DATA_DIR),
         "method": WINDOW_MODE,
+        "atr_method": ATR_METHOD,
         "period_days": PERIOD_DAYS,
         "atr_period": ATR_PERIOD,
         "turnover_period": TURNOVER_PERIOD,
@@ -497,6 +549,7 @@ def main():
     log("\n" + "=" * 70)
     log("HISTORICAL TOP-10 BUILD FINISHED")
     log("=" * 70)
+
     log(f"REGISTRY INSTRUMENTS: {len(instruments)}")
     log(f"INSTRUMENTS WITH DATA: {len(data)}")
     log(f"SELECTION DATES: {len(selection_dates)}")
@@ -507,6 +560,7 @@ def main():
     log(f"FAILED DAILY CHUNKS IN MANIFEST: {failed_chunks}")
     log(f"INVALID ROWS: {invalid_total}")
     log(f"DUPLICATE ROWS: {duplicate_total}")
+    log(f"ATR METHOD: {ATR_METHOD}")
 
     log("\nOUTPUT:")
     log(str(top_path))
@@ -519,6 +573,8 @@ def main():
     log("NO THRESHOLD IS OPTIMIZED")
     log("NO FILTER IS INSTALLED")
     log("NO LIVE ORDERS")
+    log("NO REAL MONEY")
+    log("NO BROKER EXECUTION")
     log("=" * 70)
 
 
