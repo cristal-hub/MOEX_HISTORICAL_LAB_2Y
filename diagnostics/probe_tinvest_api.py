@@ -1,13 +1,17 @@
 
 # ============================================================
 # MOEX_HISTORICAL_LAB_2Y
-# FIRST T-INVEST API PROBE
+# T-INVEST API DIAGNOSTICS — V2
 #
 # RESEARCH ONLY
 # READ ONLY
 # NO LIVE ORDERS
 # NO REAL MONEY
 # NO BROKER EXECUTION
+#
+# Uses ONLY TINKOFF_READONLY_TOKEN.
+# Does not modify the old scalper project.
+# Does not save or print token values.
 # ============================================================
 
 import csv
@@ -21,18 +25,19 @@ ROOT = Path(
     r"C:\Users\Cristal\Desktop\MOEX_HISTORICAL_LAB_2Y"
 )
 
-OLD_ENV = Path(
+ENV_FILE = Path(
     r"C:\Users\Cristal\Desktop\Tsclp_v2.1_volatile\.env"
 )
 
 OUT = ROOT / "results" / "api_probe"
 
-TICKERS = ["SBER", "GAZP"]
+TICKERS = [
+    "SBER", "GAZP", "LKOH", "ROSN", "VTBR",
+    "YDEX", "T", "OZON", "NVTK", "GMKN"
+]
 
-# Small initial test only.
 DAILY_DAYS = 30
 FIVE_MIN_DAYS = 3
-
 PAUSE = 0.5
 
 
@@ -40,12 +45,9 @@ def log(message):
     print(message, flush=True)
 
 
-
 def read_token(path):
     if not path.exists():
-        raise FileNotFoundError(
-            "Old project's .env file not found."
-        )
+        raise FileNotFoundError(".env file not found")
 
     for raw_line in path.read_text(
         encoding="utf-8-sig"
@@ -75,15 +77,26 @@ def read_token(path):
 
         if not value:
             raise RuntimeError(
-                "TINKOFF_READONLY_TOKEN is empty."
+                "TINKOFF_READONLY_TOKEN is empty"
             )
 
-        return value, "TINKOFF_READONLY_TOKEN"
+        return value
 
     raise RuntimeError(
-        "TINKOFF_READONLY_TOKEN not found in .env."
+        "TINKOFF_READONLY_TOKEN not found"
     )
 
+
+def safe_value(obj, field):
+    value = getattr(obj, field, None)
+
+    if value is None:
+        return None
+
+    if hasattr(value, "name"):
+        return str(value.name)
+
+    return str(value)
 
 
 def quotation(value):
@@ -110,29 +123,113 @@ def candle_dict(c):
     }
 
 
+def instrument_dict(instrument):
+    fields = [
+        "ticker",
+        "name",
+        "figi",
+        "uid",
+        "class_code",
+        "exchange",
+        "currency",
+        "lot",
+        "api_trade_available_flag",
+        "buy_available_flag",
+        "sell_available_flag",
+        "trading_status",
+        "instrument_type",
+        "first_1day_candle_date",
+        "first_1min_candle_date",
+        "otc_flag",
+        "for_qual_investor_flag",
+    ]
+
+    result = {}
+
+    for field in fields:
+        value = getattr(instrument, field, None)
+
+        if hasattr(value, "isoformat"):
+            value = value.isoformat()
+        elif value is not None:
+            value = safe_value(instrument, field)
+
+        result[field] = value
+
+    return result
+
+
+def test_candles(client, instrument, ticker, interval_name,
+                 interval, date_from, date_to, csv_rows):
+
+    uid = getattr(instrument, "uid", None)
+
+    if not uid:
+        return {
+            "status": "SKIPPED",
+            "reason": "Instrument UID is empty"
+        }
+
+    try:
+        response = client.market_data.get_candles(
+            instrument_id=uid,
+            from_=date_from,
+            to=date_to,
+            interval=interval,
+        )
+
+        candles = [
+            candle_dict(c)
+            for c in response.candles
+        ]
+
+        for candle in candles:
+            csv_rows.append({
+                "ticker": ticker,
+                "uid": uid,
+                "interval": interval_name,
+                **candle,
+            })
+
+        return {
+            "status": "OK",
+            "count": len(candles),
+            "first": (
+                candles[0]["time"] if candles else None
+            ),
+            "last": (
+                candles[-1]["time"] if candles else None
+            ),
+        }
+
+    except Exception as exc:
+        return {
+            "status": "ERROR",
+            "error": str(exc),
+        }
+
+
 def main():
 
     OUT.mkdir(parents=True, exist_ok=True)
 
-    log("=" * 60)
-    log("T-INVEST API FIRST PROBE")
+    log("=" * 65)
+    log("T-INVEST API DIAGNOSTICS V2")
     log("READ ONLY / NO TRADING")
-    log("=" * 60)
+    log("=" * 65)
 
-    # Imports
     from t_tech.invest import Client, CandleInterval
 
     sdk_version = version("t-tech-investments")
+    token = read_token(ENV_FILE)
+
     log("SDK VERSION: " + sdk_version)
-
-    # Local token
-    token, token_key = read_token(OLD_ENV)
-
-    log("TOKEN FILE: FOUND")
-    log("TOKEN VARIABLE: " + token_key)
+    log("TOKEN VARIABLE: TINKOFF_READONLY_TOKEN")
     log("TOKEN VALUE: HIDDEN")
 
     now = datetime.now(timezone.utc)
+    daily_from = now - timedelta(days=DAILY_DAYS)
+    five_from = now - timedelta(days=FIVE_MIN_DAYS)
 
     report = {
         "created_utc": now.isoformat(),
@@ -142,9 +239,10 @@ def main():
         "real_money": False,
         "broker_execution": False,
         "token_value_saved": False,
-        "token_variable": token_key,
         "authorization": "NOT_TESTED",
         "instrument_list": "NOT_TESTED",
+        "shares_received": 0,
+        "requested_tickers": TICKERS,
         "instruments": [],
         "errors": [],
     }
@@ -155,12 +253,10 @@ def main():
 
     with Client(token) as client:
 
-        # Authorization check.
         try:
             client.users.get_info()
             report["authorization"] = "OK"
             log("AUTHORIZATION: OK")
-
         except Exception as exc:
             report["authorization"] = "ERROR"
             report["errors"].append({
@@ -173,7 +269,6 @@ def main():
 
         time.sleep(PAUSE)
 
-        # Get available shares.
         log("\nREQUESTING SHARE INSTRUMENT LIST...")
 
         try:
@@ -183,10 +278,7 @@ def main():
             report["instrument_list"] = "OK"
             report["shares_received"] = len(shares)
 
-            log(
-                "SHARES RECEIVED: "
-                + str(len(shares))
-            )
+            log("SHARES RECEIVED: " + str(len(shares)))
 
         except Exception as exc:
             report["instrument_list"] = "ERROR"
@@ -194,236 +286,153 @@ def main():
                 "stage": "instrument_list",
                 "error": str(exc),
             })
-            raise RuntimeError(
-                "Cannot retrieve shares: " + str(exc)
-            )
+            raise
 
-        # Find requested tickers.
-        selected = {}
+        # IMPORTANT:
+        # Find by ticker ONLY.
+        # Do NOT filter by exchange, currency or trade flags.
+
+        matches = {}
 
         for instrument in shares:
+            ticker = str(
+                getattr(instrument, "ticker", "")
+            ).strip().upper()
 
-            ticker = getattr(
-                instrument,
-                "ticker",
-                ""
-            )
-
-            exchange = str(
-                getattr(instrument, "exchange", "")
-            )
-
-            currency = str(
-                getattr(instrument, "currency", "")
-            )
-
-            api_flag = bool(
-                getattr(
-                    instrument,
-                    "api_trade_available_flag",
-                    False
+            if ticker in TICKERS:
+                matches.setdefault(ticker, []).append(
+                    instrument
                 )
-            )
 
-            buy_flag = bool(
-                getattr(
-                    instrument,
-                    "buy_available_flag",
-                    False
-                )
-            )
+        log("\nTICKER SEARCH RESULTS:")
 
-            sell_flag = bool(
-                getattr(
-                    instrument,
-                    "sell_available_flag",
-                    False
-                )
-            )
+        for ticker in TICKERS:
+            count = len(matches.get(ticker, []))
+            log(f"{ticker}: {count} match(es)")
 
-            if ticker not in TICKERS:
-                continue
-
-            if exchange.upper() != "MOEX":
-                continue
-
-            if currency.lower() != "rub":
-                continue
-
-            if not api_flag or not buy_flag or not sell_flag:
-                continue
-
-            selected[ticker] = instrument
-
-        # Historical data tests.
+        # Test every matching instrument separately.
         for ticker in TICKERS:
 
-            log("\n" + "-" * 45)
-            log("INSTRUMENT: " + ticker)
+            candidates = matches.get(ticker, [])
 
-            instrument = selected.get(ticker)
+            log("\n" + "-" * 60)
+            log("TICKER: " + ticker)
 
-            if instrument is None:
-                log(
-                    "NOT FOUND AS CURRENT TRADEABLE MOEX SHARE"
-                )
+            if not candidates:
+                log("NOT FOUND IN SHARES LIST")
 
                 report["instruments"].append({
                     "ticker": ticker,
-                    "selection": "NOT_FOUND_OR_NOT_AVAILABLE",
+                    "search_status": "NOT_FOUND_IN_SHARES",
+                    "candidates": [],
                 })
                 continue
 
-            uid = getattr(instrument, "uid", None)
-
-            item = {
+            ticker_item = {
                 "ticker": ticker,
-                "name": getattr(instrument, "name", ""),
-                "figi": getattr(instrument, "figi", ""),
-                "uid": uid,
-                "exchange": str(
-                    getattr(instrument, "exchange", "")
-                ),
-                "currency": str(
-                    getattr(instrument, "currency", "")
-                ),
-                "lot": getattr(instrument, "lot", None),
-                "first_1day_candle_date": str(
-                    getattr(
-                        instrument,
-                        "first_1day_candle_date",
-                        None
-                    )
-                ),
-                "tests": {},
+                "search_status": "FOUND",
+                "candidate_count": len(candidates),
+                "candidates": [],
             }
 
-            # 1D request.
-            daily_from = now - timedelta(
-                days=DAILY_DAYS
-            )
+            for index, instrument in enumerate(
+                candidates, start=1
+            ):
 
-            try:
-                response = client.market_data.get_candles(
-                    instrument_id=uid,
-                    from_=daily_from,
-                    to=now,
-                    interval=(
-                        CandleInterval.CANDLE_INTERVAL_DAY
-                    ),
-                )
-
-                candles = [
-                    candle_dict(c)
-                    for c in response.candles
-                ]
-
-                item["tests"]["1D"] = {
-                    "status": "OK",
-                    "count": len(candles),
-                    "first": (
-                        candles[0]["time"]
-                        if candles else None
-                    ),
-                    "last": (
-                        candles[-1]["time"]
-                        if candles else None
-                    ),
-                }
-
-                for c in candles:
-                    csv_rows.append({
-                        "ticker": ticker,
-                        "interval": "1D",
-                        **c,
-                    })
+                metadata = instrument_dict(instrument)
 
                 log(
-                    "1D: OK, candles = "
-                    + str(len(candles))
+                    f"\nCANDIDATE {index}/{len(candidates)}"
                 )
 
-            except Exception as exc:
-                item["tests"]["1D"] = {
-                    "status": "ERROR",
-                    "error": str(exc),
+                for field in [
+                    "name",
+                    "uid",
+                    "figi",
+                    "class_code",
+                    "exchange",
+                    "currency",
+                    "lot",
+                    "api_trade_available_flag",
+                    "buy_available_flag",
+                    "sell_available_flag",
+                    "trading_status",
+                    "first_1day_candle_date",
+                ]:
+                    log(
+                        f"{field}: {metadata.get(field)}"
+                    )
+
+                candidate = {
+                    "metadata": metadata,
+                    "tests": {},
                 }
 
-                report["errors"].append({
-                    "ticker": ticker,
-                    "test": "1D",
-                    "error": str(exc),
-                })
+                uid = metadata.get("uid")
 
-                log("1D ERROR: " + str(exc))
+                if not uid:
+                    candidate["tests"]["status"] = (
+                        "NO_UID"
+                    )
+                    ticker_item["candidates"].append(
+                        candidate
+                    )
+                    continue
 
-            time.sleep(PAUSE)
+                log("\nTESTING DAILY CANDLES...")
 
-            # 5M request.
-            five_from = now - timedelta(
-                days=FIVE_MIN_DAYS
-            )
-
-            try:
-                response = client.market_data.get_candles(
-                    instrument_id=uid,
-                    from_=five_from,
-                    to=now,
-                    interval=(
-                        CandleInterval.CANDLE_INTERVAL_5_MIN
-                    ),
+                candidate["tests"]["1D_30D"] = test_candles(
+                    client,
+                    instrument,
+                    ticker,
+                    "1D",
+                    CandleInterval.CANDLE_INTERVAL_DAY,
+                    daily_from,
+                    now,
+                    csv_rows,
                 )
-
-                candles = [
-                    candle_dict(c)
-                    for c in response.candles
-                ]
-
-                item["tests"]["5M"] = {
-                    "status": "OK",
-                    "count": len(candles),
-                    "first": (
-                        candles[0]["time"]
-                        if candles else None
-                    ),
-                    "last": (
-                        candles[-1]["time"]
-                        if candles else None
-                    ),
-                }
-
-                for c in candles:
-                    csv_rows.append({
-                        "ticker": ticker,
-                        "interval": "5M",
-                        **c,
-                    })
 
                 log(
-                    "5M: OK, candles = "
-                    + str(len(candles))
+                    "1D RESULT: "
+                    + json.dumps(
+                        candidate["tests"]["1D_30D"],
+                        ensure_ascii=False
+                    )
                 )
 
-            except Exception as exc:
-                item["tests"]["5M"] = {
-                    "status": "ERROR",
-                    "error": str(exc),
-                }
+                time.sleep(PAUSE)
 
-                report["errors"].append({
-                    "ticker": ticker,
-                    "test": "5M",
-                    "error": str(exc),
-                })
+                log("TESTING 5M CANDLES...")
 
-                log("5M ERROR: " + str(exc))
+                candidate["tests"]["5M_3D"] = test_candles(
+                    client,
+                    instrument,
+                    ticker,
+                    "5M",
+                    CandleInterval.CANDLE_INTERVAL_5_MIN,
+                    five_from,
+                    now,
+                    csv_rows,
+                )
 
-            report["instruments"].append(item)
+                log(
+                    "5M RESULT: "
+                    + json.dumps(
+                        candidate["tests"]["5M_3D"],
+                        ensure_ascii=False
+                    )
+                )
 
-            time.sleep(PAUSE)
+                ticker_item["candidates"].append(
+                    candidate
+                )
 
-    # Save JSON report.
-    json_path = OUT / "api_probe_report.json"
+                time.sleep(PAUSE)
+
+            report["instruments"].append(ticker_item)
+
+    json_path = OUT / "api_probe_report_v2.json"
+    csv_path = OUT / "api_probe_candles_v2.csv"
 
     json_path.write_text(
         json.dumps(
@@ -434,45 +443,49 @@ def main():
         encoding="utf-8"
     )
 
-    # Save candles CSV.
-    csv_path = OUT / "api_probe_candles.csv"
+    fields = [
+        "ticker",
+        "uid",
+        "interval",
+        "time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "is_complete",
+    ]
 
     with csv_path.open(
         "w",
         newline="",
         encoding="utf-8-sig"
-    ) as f:
-
-        fields = [
-            "ticker",
-            "interval",
-            "time",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "is_complete",
-        ]
+    ) as file:
 
         writer = csv.DictWriter(
-            f,
+            file,
             fieldnames=fields
         )
-
         writer.writeheader()
         writer.writerows(csv_rows)
 
-    log("\n" + "=" * 60)
-    log("PROBE FINISHED")
+    log("\n" + "=" * 65)
+    log("PROBE V2 FINISHED")
     log("AUTHORIZATION: " + report["authorization"])
     log("INSTRUMENT LIST: " + report["instrument_list"])
+    log("SHARES: " + str(report["shares_received"]))
+    log("MATCHED TICKERS: " + str(
+        sum(
+            1 for x in report["instruments"]
+            if x["search_status"] == "FOUND"
+        )
+    ))
     log("ERRORS: " + str(len(report["errors"])))
     log("JSON: " + str(json_path))
     log("CSV: " + str(csv_path))
     log("TOKEN VALUE: NOT SAVED")
     log("NO TRADING OPERATIONS")
-    log("=" * 60)
+    log("=" * 65)
 
 
 if __name__ == "__main__":
